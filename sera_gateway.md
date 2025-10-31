@@ -1,7 +1,7 @@
 # /ai/assets/docs/sera_guides/sera_gateway.md
 # Sera AI Gateway Documentation
 
-**Version:** 1.2
+**Version:** 1.1
 **Date:** 2025-11-01
 **Author:** Martin Kecka & Gemini AI
 
@@ -9,26 +9,32 @@
 
 ## 1. Overview 📜
 
-The Sera AI Gateway is a secure, centralized web portal for accessing various internal AI and Machine Learning applications. It acts as an intelligent reverse proxy that handles user authentication, authorization, and on-demand spawning of application instances.
+The Sera AI Gateway is a secure, centralized web portal (`https://sera-ai.gt-t.net`) that serves as the single entry point for all applications within the SERA AI Ecosystem.
 
-The core purpose is to provide a single, secure entry point (**https://sera-ai.gt-t.net**) for users. It abstracts away the complexity of accessing different backend services, whether they are simple on-demand Streamlit scripts or complex, persistent applications built with a modern React/FastAPI stack.
+It has evolved into a sophisticated, intelligent reverse proxy with two primary responsibilities:
+
+1.  **On-Demand Instance Management:** For applications like Streamlit or simple Python scripts, the gateway dynamically **spawns, manages, and terminates** individual application instances for each user.
+2.  **Authenticating Proxy for Services:** For modern, persistent applications (like React frontends with FastAPI backends, e.g., CAP/CAA), the gateway acts as a secure **authenticating reverse proxy**. It validates the user's session and forwards requests to the correct persistent backend service, injecting the user's identity as HTTP headers.
+
+It handles all user authentication, authorization, session management, and traffic proxying, providing a seamless and secure experience while abstracting the backend complexity from the end-user.
 
 ---
 
 ## 2. Core Components 🏗️
 
-The system is built around a few key files that work together.
+The system is built around a few key files that work together:
 
-* **`config.py`**: The central configuration file. It defines everything from authentication methods and LDAP server details to the list of available applications and session settings. This is the primary file to modify when adding new apps or changing environment settings.
 * **`main.py`**: The heart of the gateway. It's a **FastAPI** application responsible for:
-    * Serving login, launcher, and spawning pages.
-    * Handling user authentication (login/logout) and session management.
-    * Proxying traffic to the correct backend, whether it's a *dynamically spawned instance* or a *persistent, long-running service*.
-    * Providing API endpoints to check application status (for spawned instances).
-    * Injecting user authentication data into HTTP headers for proxied services.
-* **`pages/`**: This directory contains the HTML templates for the user interface (`login.html`, `launcher.html`, and `spawning.html`).
-* **`tmp/sera_ai_instances.db`**: A local **SQLite** database that tracks the state (`spawning`, `ready`, `failed`), PID, and port of active **on-demand** application instances.
-    * **Note:** This is *not* used for `launch_type: "service"` applications (like CAP/CAA) which run persistently.
+    * Serving the login, launcher, and spawning pages.
+    * Handling user authentication (login/logout) via LDAP or a fallback dictionary.
+    * Managing the application lifecycle (spawning, proxying, and cleanup).
+    * Proxying HTTP, API, and WebSocket traffic to the correct backend.
+* **`config.py`**: The central configuration file. It defines:
+    * Authentication methods (LDAP/dict) and server details.
+    * Session and security settings (`SECRET_KEY`, `INTERNAL_API_KEY`).
+    * The **`APPLICATIONS` dictionary**, which is the "service registry" that tells the gateway *how* to handle each application (e.g., spawn a process vs. proxy to a service).
+* **`pages/`**: Contains the static HTML templates for the user interface (`login.html`, `launcher.html`, `spawning.html`).
+* **`tmp/sera_ai_instances.db`**: A lightweight **SQLite database** that acts as the state store for on-demand instances. It tracks the `key` (user + app_id), `pid`, `port`, `status` (`spawning`, `ready`, `failed`), and `last_accessed` time for each running process.
 
 ---
 
@@ -38,72 +44,113 @@ The gateway uses a robust, two-layered approach to control access.
 
 ### Authentication
 
-Authentication is the process of verifying a user's identity. The gateway supports two methods, controlled by the `AUTH_METHOD` variable in `config.py`:
+Authentication verifies a user's identity. The gateway supports two methods, controlled by `AUTH_METHOD` in `config.py`:
 
-* **LDAP (Primary)**: When `AUTH_METHOD` is set to `"ldap"`, the gateway connects to the configured Active Directory servers. It first verifies the user's credentials (`sAMAccountName` and password). It then performs a critical check: the user must be a member (directly or through nesting) of the main **`SERA-Role-GeneralUsers`** group or the **`SERA-Role-Admins`** group. If both checks pass, the user is authenticated.
-* **Dictionary (Fallback)**: If `ldap3` isn't installed or `AUTH_METHOD` is set to `"dict"`, the gateway uses the `VALID_USERS` dictionary in `config.py` for basic username/password validation. This is primarily for development and testing.
+* **LDAP (Primary)**: When set to `"ldap"`, the gateway connects to Active Directory.
+    1.  It first validates the user's `sAMAccountName` and password.
+    2.  It then performs a crucial check: the user **must** be a member (directly or nested) of the primary login group (`LDAP_ALLOWED_GROUP_CN`, e.g., "SERA-Role-GeneralUsers") or the admin group (`LDAP_ADMIN_GROUP_CN`).
+    3.  If both checks pass, an authenticated session is created.
+* **Dictionary (Fallback)**: If `AUTH_METHOD` is `"dict"`, it uses the `VALID_USERS` dictionary for development and testing.
 
-Session data (username, display name, group memberships) is stored in a secure, signed, and timed browser cookie. The session cookie is refreshed on every request, implementing a "sliding" inactivity timeout defined by `SESSION_INACTIVITY_TIMEOUT_SECONDS`.
+### Session Management
+
+Session data (username, display name, group memberships) is stored in a secure, signed, and timed browser cookie using the **ItsDangerous** library.
+
+The gateway features a **sliding session timeout**. A middleware (`refresh_session_middleware`) re-issues the session cookie on *every* request, renewing its expiration time. This means the user is only logged out after a true period of inactivity (defined by `SESSION_INACTIVITY_TIMEOUT_SECONDS`), not after a fixed time from login.
 
 ### Authorization
 
-Authorization is the process of determining what an authenticated user is allowed to do.
+Authorization determines what an authenticated user is allowed to do.
 
-* Access to each application is controlled by the `allowed_groups` list within its definition in the `APPLICATIONS` dictionary in `config.py`.
-* The gateway compares the user's LDAP groups (stored in their session cookie) against the application's `allowed_groups`.
-* Users in the **`SERA-Role-Admins`** group are super-users and have access to all applications, bypassing individual checks.
-
-### Passing Identity to Backend Services
-
-For persistent services (like React/FastAPI applications), the gateway's primary role is authentication. After validating the user's session, it injects their identity into the proxied HTTP request using the following headers:
-
-* **`X-Forwarded-User`**: The user's `sAMAccountName` (e.g., `jdoe`).
-* **`X-Forwarded-Display-Name`**: The user's display name (e.g., `John Doe`).
-* **`X-Forwarded-Groups`**: A comma-separated list of the user's relevant SERA group CNs (e.g., `SERA-Role-Admins,SERA-App-CAP-Users`).
-
-The backend service (e.g., CAP) is then responsible for its own internal authorization based on these trusted headers.
+* Access to each application is controlled by the `allowed_groups` list in its `config.py:APPLICATIONS` definition.
+* The gateway compares the user's LDAP groups (from their session cookie) against the application's `allowed_groups`.
+* Users in the `LDAP_ADMIN_GROUP_CN` ("SERA-Role-Admins") bypass this check and have access to all applications.
 
 ---
 
-## 4. Application Proxy Models ⚙️
+## 4. Application Launch & Proxy Architecture ⚙️
 
-The gateway supports two distinct models for managing and proxying applications, controlled by the `launch_type` in `config.py`.
+This is the core logic of the gateway. The routing and launch behavior is determined entirely by the `launch_type` specified for each app in the `config.py:APPLICATIONS` dictionary.
 
-### Model 1: On-Demand Instance Spawning (e.g., Streamlit)
+### Type 1: On-Demand Instances (`launch_type: "streamlit"` or `"python"`)
 
-This model is for simple, single-user applications (like Streamlit scripts or basic Python apps) that are not designed to run persistently.
+This flow is used for applications that are spawned on-demand for a single user.
 
-* **Config:** `launch_type: "streamlit"` or `launch_type: "python"`
-* **Process:**
-    1.  **User Request**: A user clicks "Launch" on an application (e.g., `sira`).
-    2.  **Check & Spawn**: The gateway checks the `sera_ai_instances.db`. If no 'ready' instance is found, it marks the instance as **`spawning`** and launches a **background thread**.
-    3.  **Status Page**: The user is immediately redirected to the dynamic status page (`/spawning/sira`). This page polls the `/status/sira` API endpoint.
-    4.  **Port Probing**: The background thread spawns the process (e.g., `streamlit run ...`) and **actively probes the new port** until it gets a successful connection.
-    5.  **Redirection**: Once the port is live, the thread updates the database to **`ready`**. The user's browser polls this new status and redirects to the application's proxy URL (`/app/sira/`).
-* **Proxy Logic**: The gateway proxies all HTTP and WebSocket traffic (e.g., `/app/sira/_stcore/stream`) to the unique port (e.g., `127.0.0.1:8502`) assigned to that user's spawned instance.
-* **Cleanup**: A background task (`cleanup_inactive_instances`) finds and terminates these spawned processes after a period of inactivity or on user logout.
+**1. Spawning Flow (Async with Polling):**
+This process is now fully asynchronous to prevent the user from seeing a "hung" browser.
+1.  User clicks "Launch" for an app (e.g., "SIRA"). The gateway receives the request at `/launch/sira`.
+2.  The `get_or_spawn_instance` function is called. It writes a "spawning" status to the `sera_ai_instances.db` for the `username_sira` key.
+3.  The gateway immediately redirects the user to `/spawning/sira`.
+4.  The `spawning.html` page is served. This page contains JavaScript that polls the `/status/sira` endpoint every 2 seconds.
+5.  In the background, a new thread runs `_spawn_process_and_update_db`. This function:
+    * Finds a free port (e.g., `8502`).
+    * Constructs the `subprocess.Popen` command (e.g., `streamlit run ... --server.port 8502`).
+    * **Launches the process and actively probes the port** in a loop until it receives a successful connection or the `APP_SPAWN_TIMEOUT_SECONDS` is reached.
+    * Once the app is confirmed to be running, it updates the database row to `status: "ready"`, `pid: 12345`, `port: 8502`.
+6.  The user's browser, still polling `/status/sira`, receives the `{"status": "ready"}` JSON response.
+7.  The JavaScript immediately redirects the user to the application's URL: `/app/sira/`.
 
-### Model 2: Persistent Service Proxy (e.g., React/FastAPI)
+**2. Proxy Flow:**
+* **HTTP:** All requests to `/app/sira/{path:path}` are handled by the `reverse_proxy_route`. It looks up the `username_sira` key in the database, finds the port (`8502`), and proxies the request to `http://127.0.0.1:8502/{path:path}`.
+* **WebSocket:** For Streamlit apps, the dedicated `@app.websocket("/app/{app_id}/_stcore/stream")` endpoint captures the WebSocket connection, looks up the correct port, and establishes a new connection to `ws://127.0.0.1:8502/_stcore/stream`, shuttling messages back and forth.
 
-This model is for modern, complex applications (like CAP or CAA) that run as persistent, long-running services and often have their own React-based UIs.
+### Type 2: Persistent Services (`launch_type: "service"`)
 
-* **Config:** `launch_type: "service"` and a `service_url` (e.g., `http://127.0.0.1:7888`).
-* **Process:**
-    1.  **User Request**: A user clicks "Launch" on the application (e.g., `cv_analysis_processor`).
-    2.  **Authentication**: The gateway validates the user's session cookie.
-    3.  **Direct Proxy**: The gateway immediately proxies the request. This model **does not use the SQLite database or spawning logic**.
-* **Proxy Logic**: The gateway's role is twofold:
-    1.  **UI Serving**: It serves the static React UI assets (e.g., `/app/cv_analysis_processor/index.html`, `/app/cv_analysis_processor/assets/main.js`).
-    2.  **API Proxying**: It proxies all API calls (e.g., `/api/share/`, `/app/cv_analysis_processor/api/v1/jobs`) to the backend `service_url`, **injecting the user's authentication headers** (`X-Forwarded-User`, etc.) into the request.
-* **Cleanup**: None. The gateway is stateless in this model. The persistent service is managed externally (e.g., by `systemd` or Kubernetes).
+This flow is used for modern, persistent applications like the **CV Analysis Processor (CAP)**, which run their own React frontend and FastAPI backend.
 
-This dual-model architecture allows the gateway to provide a seamless single sign-on (SSO) experience for all applications in the ecosystem, regardless of their underlying technology.
+**1. "Launch" Flow:**
+1.  User clicks "Launch" for "CAP" (`/launch/cv_analysis_processor`).
+2.  The gateway sees `launch_type: "service"`.
+3.  **No spawning occurs.**
+4.  The user is immediately redirected to the application's root URL: `/app/cv_analysis_processor/`.
+
+**2. Proxy Flow (Frontend & Backend):**
+This is where the gateway acts as an *authenticating proxy*.
+* **Frontend (React App):** The user's request to `/app/cv_analysis_processor/` (and for all its static assets like `.js` and `.css` files) is handled by the `reverse_proxy_route`.
+    * It checks the user's session and authorization.
+    * It looks up the `service_url` from `config.py` (e.g., `http://127.0.0.1:7888`).
+    * It proxies the request to `http://127.0.0.1:7888/`.
+* **Backend (FastAPI API):** The React application makes API calls to its *own* backend, but it makes them to the gateway's path (e.g., `/api/positions`).
+    * A dedicated route, `@app.api_route("/api/{path:path}")`, captures these.
+    * The gateway authenticates the user's session cookie.
+    * It proxies the request to the backend service's API path (e.g., `http://127.0.0.1:7888/api/{path:path}`).
+    * **Crucially, it injects the user's identity as HTTP headers** that the backend service (CAP) can trust:
+        * `X-Forwarded-User`: The user's `sAMAccountName`.
+        * `X-Forwarded-Display-Name`: The user's `givenName` from LDAP.
+        * `X-Forwarded-Groups`: A comma-separated list of the user's relevant AD groups (e.g., `SERA-App-CAP-Admins,SERA-Role-Admins`).
 
 ---
 
-## 5. Future Enhancements & Roadmap 🚀
+## 5. Instance & Session Management 🧹
 
-While the core functionality is robust, several enhancements could be considered for future versions.
+### Instance Cleanup
+A background task (`cleanup_inactive_instances`) runs periodically (e.g., every 5 minutes) to maintain hygiene for **on-demand instances**:
+* **Dead PIDs:** It finds instances in the DB where the `pid` is no longer running on the server and removes them.
+* **Inactivity:** It finds instances where `(current_time - last_accessed) > APP_INSTANCE_MAX_INACTIVE_SECONDS` (e.g., 6 hours). It terminates the process (`os.kill`) and removes the DB entry.
+* **Failed Spawns:** It cleans up any entries stuck in the "spawning" or "failed" state for too long.
 
-* **Modernized User Interface (UI):** The gateway's own `launcher.html` page is functional but could be modernized to improve aesthetics, perhaps matching the look and feel of the newer React applications.
-* **Centralized Observability:** While logs are captured, the gateway is in a prime position to log standardized metrics (like request counts and timings per app) to a central dashboard (e.g., Grafana/Prometheus) to provide a high-level overview of ecosystem health and application usage.
+### Logout
+When a user visits `/logout`:
+1.  All **on-demand instances** associated with that user are terminated, and their DB entries are deleted.
+2.  The `session` cookie is cleared.
+3.  The user is redirected to the login page.
+(Note: This does *not* affect persistent `service` applications, only the spawned processes.)
+
+---
+
+## 6. Internal API Endpoints 🔌
+
+To support a microservice-based ecosystem, the gateway exposes internal API endpoints secured by the `INTERNAL_API_KEY`.
+
+* **`GET /api/internal/users?group_cn=...`**:
+    * This allows other trusted backend services (like CAP) to query the gateway for a list of users in a specific Active Directory group.
+    * This is critical for features like allowing a CAP Admin to see a list of all `SERA-App-CAP-Users` without the CAP service needing its own LDAP credentials.
+    * The gateway acts as the central, secure broker for LDAP queries.
+
+---
+
+## 7. Roadmap & Future Enhancements 🚀
+
+* **SAML/SSO Integration:** The current username/password form will be supplemented or replaced with a full SAML 2.0 / ADFS integration to provide a true single sign-on (SSO) experience.
+* **Containerization:** The gateway (and its `systemd` service) will be containerized for deployment in Kubernetes, aligning with the rest of the SERA ecosystem. The SQLite database will be replaced with a Persistent Volume Claim (PVC) or a shared database.
+* **Dynamic App Configuration:** The `APPLICATIONS` dictionary, currently hardcoded in `config.py`, could be moved into the database to allow for dynamic registration of new applications without restarting the gateway.

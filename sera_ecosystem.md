@@ -229,9 +229,18 @@ This principle mandates that every component in the ecosystem must be engineered
 
 **Challenge**: In a fully internal environment, the primary security threat is not an external attacker but the potential for accidental or intentional misuse by an authenticated user. An authorized user might phrase a request ambiguously, which an overeager AI could misinterpret and apply to a production system. The challenge is to build robust guardrails that prevent the system's powerful capabilities from causing unintended consequences.
 
-**Ecosystem-Wide Mitigation: Principle of Least Privilege & Module-Driven Confirmation**
+**Ecosystem-Wide Mitigation: Centralized, Header-Based RBAC**
+The entire ecosystem operates on a "trust but verify" model, with the **Sera AI Gateway** acting as the single, trusted source of user identity.
 
-* **Scoped Tool Access (RBAC)**: The Sera AI Gateway passes the user's authenticated Active Directory group information to the Orchestrator. The Orchestrator must use this information to enforce **Role-Based Access Control (RBAC)**, filtering the list of tools and modules available to the user for that specific session. This ensures users can only access the capabilities relevant to their role.
+* **Centralized Authentication:** The Gateway is solely responsible for authenticating the user (e.g., via LDAP) and performing a primary authorization check (e.g., is the user in the main `SERA-Role-GeneralUsers` group).
+* **Identity Injection:** Upon successful authentication, the Gateway proxies all requests to backend modules (the Orchestrator, CAP, CAA, RAF, etc.) and injects the user's verified identity into the HTTP request headers. The standard headers are:
+    * `X-Forwarded-User`: The user's `sAMAccountName` (e.g., `jdoe`).
+    * `X-Forwarded-Display-Name`: The user's full name (e.g., `Jane Doe`).
+    * `X-Forwarded-Groups`: A comma-separated string of the user's relevant AD group memberships (e.g., `SERA-Role-Admins,SERA-App-CAP-Users`).
+* **Module-Level Authorization:** Every module in the ecosystem *must* use these injected headers to perform its own, fine-grained Role-Based Access Control (RBAC). The module *must not* have its own separate authentication system.
+    * **Orchestrator Example:** The Orchestrator reads the `X-Forwarded-Groups` header to filter the list of tools from `tools.d/` that the user is allowed to see and execute.
+    * **React/FastAPI App Example (e.g., CAP):** The FastAPI backend reads the `X-Forwarded-Groups` header to control API access (e.g., allowing "Delete" only for `SERA-App-CAP-Admins`) and to inform the React UI what components to render (e.g., show the "Settings" page).
+    * **Framework Example (e.g., RAF):** The RAF reads the `X-Forwarded-User` header to validate if that user has permission to execute a specific high-stakes automation workflow.
 * **Module-Driven Confirmation Loop**: For any high-impact action, the responsibility for requiring confirmation lies with the specialized module performing the task (e.g., the Remote Automation Assistant). The module must formulate the confirmation request and send it to the Orchestrator. The Orchestrator's role is to act as a trusted intermediary, relaying this prompt to the end-user and securely passing the user's explicit consent back to the module before the final action is executed.
 * **Framework-Level Parameter Validation**: The ultimate responsibility for validating the parameters of an action lies with the execution engine. For example, the Remote Automation Framework (RAF) must provide a final, deterministic safety check by validating any parameters it receives from an AI Assistant against its own internal allowlists, denylists, and business rules before executing a command.
 
@@ -262,9 +271,12 @@ This section describes the primary components that form the SERA ecosystem.
 
 * **Sera AI Gateway**
     The Gateway (`https://sera-ai.gt-t.net`) is the single, secure entry point for all users. It is an intelligent reverse proxy responsible for:
-    * **Authentication & Authorization**: Verifying user identity against LDAP/Active Directory and checking group memberships to control access.
-    * **Application Spawning**: Dynamically launching and managing application instances (e.g., Streamlit apps) on-demand for each user.
-    * **Traffic Proxying**: Securely forwarding HTTP and WebSocket traffic to the correct backend application instance.
+    * **Authentication & Session Management**: Verifying user identity against LDAP/Active Directory and managing a secure, sliding session cookie.
+    * **Centralized Authorization**: Performing the primary authorization check (is the user a general SERA user?) and securely passing the user's identity and full list of group memberships (e.g., `SERA-App-CAP-Admins`) to all downstream applications via HTTP headers.
+    * **Dual-Mode Application Serving**:
+        1.  **On-Demand Spawning**: Dynamically launching and managing application instances (e.g., Streamlit apps) for each user, tracking their state in a local database.
+        2.  **Service Proxying**: Acting as an authenticating reverse proxy for persistent, modern applications (e.g., React/FastAPI services like CAP and CAA).
+    * **Traffic Proxying**: Securely forwarding all HTTP, API, and WebSocket traffic to the correct backend application instance or service.
 * **Sera Orchestrator**
     The Orchestrator is the central reasoning engine. It manages the entire lifecycle of a user query:
     * **User Interaction**: Manages the chat interface and persists conversation history using PostgreSQL and ChromaDB.
@@ -478,29 +490,43 @@ The SERA platform is composed of several specialized modules that are designed t
 
 To ensure consistency and clarity across the ecosystem, each new module must be classified and named according to one, and only one, of the following categories. This is a strict definitional standard for the platform, as the category often forms part of the module's name or identifier. A module cannot belong to multiple categories.
 
-* **(A) Assistant:**: Specialized agents that perform complex reasoning, planning, and task orchestration. An Assistant acts as the "brain" for a specific domain (like infrastructure automation). It can either dynamically compose calls to simple (C) Connectors for novel tasks or delegate the execution of complex tasks to a (F) Framework. (e.g., Remote Automation Assistant (RAA))
+* **(A) Assistant:**: Specialized agents that perform complex reasoning, planning, and task orchestration. An Assistant acts as the "brain" for a specific domain (like infrastructure automation or cash application). It can dynamically compose calls to simple (C) Connectors or, as a full-scale application (e.g., **CAA**), manage a complex business process via its own UI.
 * **(C) Connector:** Bridges to external systems/APIs for data exchange or simple, direct actions (e.g., Jira Connector, ServiceNow Connector) -> no LLM
-* **(F) Framework:** Core backend platforms that act as secure execution engines for pre-defined, multi-system workflows or reports. They are called by (A) Assistants to run complex, audited tasks. A Framework (like the RAF) contains the actual business logic for high-stakes automations, ensuring that AI agents operate within safe, pre-approved boundaries. (e.g., Remote Automation Framework (RAF))
-* **(I) Ingestor:** Data ingestion pipelines that populate the shared data stores (e.g., Confluence Ingestor).
-* **(P) Processor:** Backend tools for data transformation, computation, or analysis (e.g., Code Analyst).
+* **(F) Framework:** Core backend platforms that act as secure execution engines for pre-defined, multi-system workflows or reports. They are called by (A) Assistants to run complex, audited tasks. (e.g., Remote Automation Framework (RAF))
+* **(I) Ingestor:** Data ingestion pipelines that populate the shared data stores (e.g., Confluence Ingestor, Bank Statement Ingestor).
+* **(P) Processor:** Backend tools for data transformation, computation, or analysis. They can be simple tools for the Orchestrator or, as a full-scale application (e.g., **CAP**), provide a dedicated UI for a complex analysis workflow.
 * **(R) Retriever:** Tools dedicated specifically to knowledge retrieval for RAG (e.g., RAG Confluence Retriever).
 * **(S) Strategist:** (Future) Advanced modules for complex, long-range planning.
-* **(U) Utility:** A self-contained microservice that provides a specific, focused capability through a direct API endpoint (typically REST/HTTP). It does not integrate with the Orchestrator via the `tools.d/*.yaml` contract and is not discoverable by the Orchestrator's reasoning engine.
+* **(U) Utility:** A **lightweight, non-user-facing** microservice that provides a specific, focused, and reusable capability (e.g., converting an address to geocoordinates, validating a file format). It is *not* a full-scale application and is intended to be called by other modules, not by end-users directly.
 
 ---
 
-## 11.3 Stand-Alone Modules (Utility Services)
+## 11.3 Stand-Alone Applications & Utility Services
 
-While the core architecture centers on the Orchestrator calling specialized Tools, the SERA ecosystem also supports **Stand-Alone Modules**. These are independent, self-contained services designed to perform specific, granular tasks that do not require the complex reasoning or multi-step planning capabilities of the Sera Orchestrator. They are classified under the **(U) Utility** category.
+While the core architecture centers on the Orchestrator calling specialized Tools (like Retrievers or Connectors), the SERA ecosystem also supports two other types of independent modules: full-scale **Stand-Alone Applications** and lightweight **Utility Services**.
 
-They function as part of the ecosystem but are intended for direct integration with other applications rather than being a "tool" in the Orchestrator's toolkit.
+### 11.3.1 Stand-Alone Applications (e.g., CAP, CAA)
 
-The primary principles governing these modules are:
+These are major, user-facing applications that address a complex business problem. They are classified by their primary function (e.g., **(P) Processor** for CAP, **(A) Assistant** for CAA) but are deployed as independent, persistent services with their own UIs (typically React + FastAPI).
 
-* **Direct Integration:** They are designed to be called directly by other applications (e.g., a web front-end, another backend service) via a simple, well-defined API, typically REST/HTTP.
-* **Self-Contained Logic:** A utility module encapsulates all the logic needed to perform its single function. It receives a request, processes it, and returns a response without needing to be part of a larger, Orchestrator-managed chain.
-* **Ecosystem Citizenship:** Despite their independence, these modules are still first-class citizens of the SERA ecosystem. They must adhere to the established Ecosystem Standards (Section 12), including standardized configuration, logging, and health checks. They leverage shared resources like the AI Factory for models.
-* **Resource Optimization:** These modules are ideal for using smaller, specialized, or fine-tuned models from the AI Factory. By design, they should avoid using the large, resource-intensive reasoning models like gemma3:27b, ensuring efficient resource use across the platform.
+The key architectural principles for these applications are:
+
+* **Gateway-Driven Authentication:** These modules **do not** have their own login pages. They rely *entirely* on the **Sera AI Gateway** to manage authentication and authorization.
+* **Header-Based RBAC:** The application's backend (e.g., FastAPI) is architected to trust and read the HTTP headers injected by the gateway:
+    * `X-Forwarded-User` (e.g., `jdoe`)
+    * `X-Forwarded-Display-Name` (e.g., `Jane Doe`)
+    * `X-Forwarded-Groups` (e.g., `SERA-App-CAP-Admins,SERA-Role-GeneralUsers`)
+    All internal permissions within the application (e.g., "Can this user see the 'Settings' page?") are determined by checking these trusted headers.
+* **Direct Access:** Users access these applications by clicking "Launch" in the Sera AI Gateway, which then proxies them to the application's React UI.
+* **Ecosystem Citizenship:** They are first-class citizens of the ecosystem, leveraging shared infrastructure like the AI Factory, PostgreSQL database, Redis, and standardized logging.
+
+### 11.3.2 Utility Services (U)
+
+These are simple, **non-user-facing** microservices classified as **(U) Utility**. They are designed to perform one specific, reusable function and are called by other modules.
+
+* **Direct Integration:** They are designed to be called directly by other applications (e.g., the Orchestrator, CAP, or another service) via a simple, well-defined API (gRPC or REST/HTTP).
+* **Self-Contained Logic:** A utility module encapsulates all logic for its single function.
+* **No User Interface:** They are purely backend services and are not intended for direct user interaction.
 
 ### Example in Practice: Geo-Location Utility (GLU)
 
