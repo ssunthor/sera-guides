@@ -1,6 +1,6 @@
 # Sera Router - Design Document
 
-**Version:** 1.0
+**Version:** 0.1
 **Date:** 2025-11-01
 **Author:** Martin Kecka & Gemini AI
 
