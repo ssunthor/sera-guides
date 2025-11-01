@@ -43,13 +43,15 @@ The Sera Router is a **Core Foundational Service** that sits at the network netw
         | 4. Performs Load Balancing (finds endpoint)
         | 5. Performs Payload Translation (builds Ollama/NIM JSON)
         | 6. Performs Parameter Injection (e.g., auto-sets `num_ctx`)
+        | 7. Performs Authentication (Reads env var, builds auth header)
         |
-        | 7. Makes direct HTTP request to the chosen endpoint
+        | 8. Makes direct HTTP request (with Auth Header) to the chosen endpoint
         v
 [HAProxy-Remote (in K8s AI Factory)]
         |
-        | 8. (e.g., [https://aif-llm-ollama-gemma3-27b.slo.gt-t.net](https://aif-llm-ollama-gemma3-27b.slo.gt-t.net))
-        |    Balances load across the 24xH100 GPU pods
+        | 9. (e.g., [https://aif-llm-ollama-gemma3-27b.slo.gt-t.net](https://aif-llm-ollama-gemma3-27b.slo.gt-t.net))
+        |    **Validates incoming Auth Header (e.g., `X-Sera-Auth-Key`)**
+        |    If valid, balances load across the 24xH100 GPU pods
         v
 [LLM GPU Pods (Ollama, NIM, VLLM)]
 
@@ -57,6 +59,7 @@ The Sera Router is a **Core Foundational Service** that sits at the network netw
 
 * **Consumers (All Modules):** The Sera Orchestrator, CAP, RMI, CFI, CAA, etc., will all be updated to use the new `sera-common` library, which contains the gRPC client for the Sera Router.
 * **Dependencies (Remote AI Factory):** The Sera Router makes outgoing HTTP/S requests to the remote HAProxy endpoints in the K8s cluster (e.g., `aif-llm-ollama-gemma3-27b.slo.gt-t.net`).
+    * **CRITICAL DEPENDENCY:** This design requires a new configuration overlay on the remote HAProxy. This HAProxy must be updated to act as an authentication gateway, validating the incoming HTTP headers (e.g., `X-Sera-Auth-Key` for Ollama, `Authorization` for NIM) sent by the Sera Router. Requests without a valid key must be rejected at the HAProxy layer.
 * **Manager (SAS):** The SAS-WebUI and CU (Configuration Utility) will be used to read, edit, and reload this module's `settings.yaml` file.
 
 ---
@@ -70,25 +73,29 @@ The Sera Router's logic for handling a single gRPC call is a multi-step pipeline
     * The Sera Router reads the `model_preference`.
     * If `model_preference` is `"auto"` (or null): It looks up the `task_type` in its `settings.yaml` `task_routing_rules` to find the target model.
         * `"summarization"` -> `model_name: "gemma3:12b"`
-        * `"classification"` -> `model_name: "gemma3:4b"`
         * `"general_reasoning"` -> `model_name: "gemma3:27b"`
     * If `model_preference` is specific (e.g., `"gemma3:27b"`): It bypasses the task router and uses the requested model directly. `model_name: "gemma3:27b"`.
 3.  **Endpoint Selection (Load Balancing):**
     * The Sera Router now has a `model_name` (e.g., `"gemma3:27b"`). It looks this up in its `settings.yaml` `model_definitions`.
     * It finds the list of available endpoints: `[slo, nyh, prg]`.
-    * It uses an internal, in-memory counter (e.g., round-robin or basic least-connections) to select the best endpoint URL (e.g., `https://aif-llm-ollama-gemma3-27b.nyh.gt-t.net`).
-    * It also retrieves the `backend_type` (e.g., `"ollama"`) for this model.
+    * It uses an internal, in-memory counter (e.g., round-robin) to select the best endpoint URL (e.g., `https://aif-llm-ollama-gemma3-27b.nyh.gt-t.net`).
+    * It also retrieves the `backend_type` (e.g., `"ollama"`) and the `authentication` config for this model.
 4.  **Payload Translation (Abstraction):**
     * The Sera Router knows the target backend is `"ollama"`.
     * It takes the generic gRPC `Content` payload and translates it into the specific JSON format that the Ollama `/api/chat` endpoint expects.
-    * (If the backend were `"nim"`, it would translate the same gRPC payload into the NVIDIA NIM JSON format).
+    * (If the backend were `"nim"`, it would translate to the NVIDIA NIM format).
 5.  **Parameter Injection (Smart Logic):**
     * Before sending, the Sera Router performs its final smart logic.
     * It reads its `parameter_injection_rules` from `settings.yaml`.
     * **Example 1 (Tokens):** It calculates the prompt token count. If `token_count > 16000`, it injects/overwrites `options: { num_ctx: 24000 }` in the Ollama JSON payload.
-    * **Example 2 (Vision):** If it detects an `image` Part in the request, it validates that the chosen model (`gemma3:27b`) actually supports vision. If not, it can either error gracefully or (in a future version) auto-route to a vision-capable model.
-6.  **Execute & Stream Response:**
-    * The Sera Router, now acting as an HTTP client, makes the `requests.post()` call to the selected remote HAProxy (e.g., `...nyh.gt-t.net`) with the fully prepared payload.
+6.  **Authentication:**
+    * The router reads the `authentication` block for the chosen model (e.g., `gemma3:27b`).
+    * It sees `type: "static_header"` and `api_key_env_var: "SERA_OLLAMA_27B_KEY"`.
+    * It retrieves the **actual key value** from its own environment (`os.environ.get("SERA_OLLAMA_27B_KEY")`).
+    * **Error Handling:** If this environment variable is not set, the router logs a critical server-side configuration error and returns a gRPC `INTERNAL` error to the client, as it cannot proceed.
+    * **Header Building:** It constructs the required HTTP header (e.g., `X-Sera-Auth-Key: <key_from_env>`) using the `header_name` and `header_value_prefix` from the config.
+7.  **Execute & Stream Response:**
+    * The Sera Router, now acting as an HTTP client, makes the `requests.post()` call to the selected remote HAProxy (e.g., `...nyh.gt-t.net`) with the fully prepared payload **and the new authentication header**.
     * It streams the response back to the original module (CAP) through the open gRPC stream, translating the backend's JSON chunks into the gRPC `GenerateContentResponse` format.
 
 ---
@@ -212,7 +219,7 @@ message UsageMetadata {
 
 ## 5. Configuration (settings.yaml)
 
-The Sera Router's "brain" is its `settings.yaml` file, which will be managed by the SAS-WebUI.
+The Sera Router's "brain" is its `settings.yaml` file, which can be managed by the SAM-WebUI.
 
 **File:** `/ai/sera_router/config/settings.yaml`
 
@@ -232,34 +239,57 @@ model_definitions:
   "gemma3:27b":
     backend_type: "ollama" # "ollama", "nim", "vllm", "openai"
     ssl_verify: false
+    authentication:
+      type: "static_header"
+      header_name: "X-Sera-Auth-Key" # Header HAProxy will check
+      header_value_prefix: ""
+      api_key_env_var: "SERA_OLLAMA_27B_KEY"
     endpoints:
-      - "[https://aif-llm-ollama-gemma3-27b.slo.gt-t.net](https://aif-llm-ollama-gemma3-27b.slo.gt-t.net)"
-      - "[https://aif-llm-ollama-gemma3-27b.nyh.gt-t.net](https://aif-llm-ollama-gemma3-27b.nyh.gt-t.net)"
-      - "[https://aif-llm-ollama-gemma3-27b.prg.gt-t.net](https://aif-llm-ollama-gemma3-27b.prg.gt-t.net)"
+      - "https://aif-llm-ollama-gemma3-27b.slo.gt-t.net"
+      - "https://aif-llm-ollama-gemma3-27b.nyh.gt-t.net"
+      - "https://aif-llm-ollama-gemma3-27b.prg.gt-t.net"
   "gemma3:12b":
     backend_type: "ollama"
     ssl_verify: false
+    authentication:
+      type: "static_header"
+      header_name: "X-Sera-Auth-Key" # Header HAProxy will check
+      header_value_prefix: ""
+      api_key_env_var: "SERA_OLLAMA_12B_KEY"
     endpoints:
-      - "[https://aif-llm-ollama-gemma3-12b.slo.gt-t.net](https://aif-llm-ollama-gemma3-12b.slo.gt-t.net)"
-      - "[https://aif-llm-ollama-gemma3-12b.nyh.gt-t.net](https://aif-llm-ollama-gemma3-12b.nyh.gt-t.net)"
+      - "https://aif-llm-ollama-gemma3-12b.slo.gt-t.net"
+      - "https://aif-llm-ollama-gemma3-12b.nyh.gt-t.net"
       - ...
   "gemma3:4b":
     backend_type: "ollama"
     ssl_verify: false
+    authentication:
+      type: "static_header"
+      header_name: "X-Sera-Auth-Key" # Header HAProxy will check
+      header_value_prefix: ""
+      api_key_env_var: "SERA_OLLAMA_4B_KEY"
     endpoints:
-      - "[https://aif-llm-ollama-gemma3-4b.slo.gt-t.net](https://aif-llm-ollama-gemma3-4b.slo.gt-t.net)"
+      - "https://aif-llm-ollama-gemma3-4b.slo.gt-t.net"
       - ...
   "nim-embedqa":
     backend_type: "nim"
-    api_key_env_var: "NVIDIA_API_KEY"
+    authentication:
+      type: "static_header"
+      header_name: "Authorization" # NIM uses standard auth
+      header_value_prefix: "Bearer "
+      api_key_env_var: "NVIDIA_API_KEY_EMBEDQA"
     endpoints:
-      - "[https://aif-llm-nim-nv-embedqa-1b-v2.slo.gt-t.net](https://aif-llm-nim-nv-embedqa-1b-v2.slo.gt-t.net)"
+      - "https://aif-llm-nim-nv-embedqa-1b-v2.slo.gt-t.net"
       - ...
   "nim-rerank":
     backend_type: "nim"
-    api_key_env_var: "NVIDIA_API_KEY"
+    authentication:
+      type: "static_header"
+      header_name: "Authorization" # NIM uses standard auth
+      header_value_prefix: "Bearer "
+      api_key_env_var: "NVIDIA_API_KEY_RERANK"
     endpoints:
-      - "[https://aif-llm-nim-nv-rerankqa-1b-v2.slo.gt-t.net](https://aif-llm-nim-nv-rerankqa-1b-v2.slo.gt-t.net)"
+      - "https://aif-llm-nim-nv-rerankqa-1b-v2.slo.gt-t.net"
       - ...
 
 # 3. Parameter Injection Rules: Smart, logic-based overrides.
