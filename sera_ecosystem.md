@@ -230,9 +230,19 @@ This principle mandates that every component in the ecosystem must be engineered
 **Challenge**: In a fully internal environment, the primary security threat is not an external attacker but the potential for accidental or intentional misuse by an authenticated user. An authorized user might phrase a request ambiguously, which an overeager AI could misinterpret and apply to a production system. The challenge is to build robust guardrails that prevent the system's powerful capabilities from causing unintended consequences.
 
 **Ecosystem-Wide Mitigation: Centralized, Header-Based RBAC**
-The entire ecosystem operates on a "trust but verify" model, with the **Sera AI Gateway** acting as the single, trusted source of user identity.
+The entire ecosystem operates on a "trust but verify" model, with the **Sera AI Gateway** acting as the single, trusted source of user identity. Access is strictly governed by a formal Active Directory naming convention and hierarchy.
 
-* **Centralized Authentication:** The Gateway is solely responsible for authenticating the user (e.g., via LDAP) and performing a primary authorization check (e.g., is the user in the main `SERA-Role-GeneralUsers` group).
+* **Standardized Active Directory RBAC Hierarchy:** The ecosystem relies on three distinct categories of AD security groups to manage identity and access:
+    * **Role (`SERA-Role-*`):** Represents top-level, global access tiers. 
+        * *Examples:* `SERA-Role-GeneralUsers` (baseline platform access), `SERA-Role-Admins` (global bypasses). 
+        * *Usage:* Evaluated by the Gateway for primary login authorization and global administrative privileges.
+    * **App (`SERA-App-*`):** Represents application-specific access rights, further split into user and administrative tiers within that specific domain.
+        * *Examples:* `SERA-App-CAP-Users`, `SERA-App-CAP-Admins`, `SERA-App-GAA-Users`.
+        * *Usage:* Used by the Gateway to authorize routing to specific microservices, and parsed by backend modules for fine-grained internal feature toggling (e.g., rendering an admin dashboard).
+    * **Group (`SERA-Group-*`):** Represents organizational or departmental boundaries.
+        * *Examples:* `SERA-Group-Finance`, `SERA-Group-SysEng`.
+        * *Usage Constraint:* **These must never be used as direct RBAC permission groups in the Gateway.** They are strictly for organizational mapping. If an entire department requires access to an application, the relevant `SERA-Group-*` should be nested inside the appropriate `SERA-App-*-Users` group within Active Directory, maintaining the integrity of the application-centric access model.
+* **Centralized Authentication:** The Gateway is solely responsible for authenticating the user (e.g., via LDAP/SAML) and performing a primary authorization check (e.g., is the user in the main `SERA-Role-GeneralUsers` group).
 * **Identity Injection:** Upon successful authentication, the Gateway proxies all requests to backend modules (the Orchestrator, CAP, CAA, RAF, etc.) and injects the user's verified identity into the HTTP request headers. The standard headers are:
     * `X-Forwarded-User`: The user's `sAMAccountName` (e.g., `jdoe`).
     * `X-Forwarded-Display-Name`: The user's full name (e.g., `Jane Doe`).
