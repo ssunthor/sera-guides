@@ -464,6 +464,8 @@ The orchestrator uses a multi-file logging system configured by `utils/logging_s
   - **General & Ongoing:**
     - [ ] Continue to refine error handling, token management (`ContextBuilder`), LLM interaction logic (`LLMInterface`), and structured logging for enhanced observability.
     - [ ] CRITICAL Fix BUG when switching personas doesn't create new clean chat, this is leading to incorrect answers/confusion.
+    - [ ] ADD speach to text.
+
 
 ## Family naming convention (draft)
 
